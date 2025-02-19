@@ -1,6 +1,12 @@
 import json
+import pickle
+import sys
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone
+
+from google_auth_httplib2 import Request
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
 from pydantic import BaseModel, Field, field_validator
 import os
 import logging
@@ -10,12 +16,9 @@ import groq
 from dotenv import load_dotenv
 
 load_dotenv()
-PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
-#client = OpenAI(api_key=PERPLEXITY_API_KEY, base_url="https://api.perplexity.ai")
-#model = "sonar"
 model = "llama-3.1-8b-instant"
 
 
@@ -45,6 +48,7 @@ class EventDetails(BaseModel):
     date: str = Field(description="Date of the event")
     time: str = Field(description="Time of the event")
     attendees: list[str] = Field(description="List of attendees")
+    calendar_link: Optional[str] = Field(description="Generated calendar link if applicable")
 
 
 class EventConfirmationEmail(BaseModel):
@@ -52,7 +56,7 @@ class EventConfirmationEmail(BaseModel):
     subject: str = Field(description="Subject of the email")
     invitee: str = Field(description="Name of participant to whom the email is addressed")
     body: str = Field(description="Natural language confirmation with event details.")
-    calendar_link: Optional[str] = Field(description="Generated calendar link if applicable")
+
 
 
 # --------------------------------------------------------------
@@ -112,9 +116,10 @@ def parse_event_details(description: EventExtraction) -> EventDetails:
                 "role": "system",
                 "content": f"{date_context} Extract detailed event information. "
                            f"When dates reference 'next Tuesday' or similar relative dates, use this current date as reference."
+                          f"Only add the 'calendar_link' field if a calendar link is available in the event details, else add None."
                            f"Return ONLY a valid JSON, without Markdown formatting (` ```json `, ` ``` `), explanations, or extra text. "
                             f"Use the following JSON format: "
-                            f'{{"name": "...", "date": "...", "time": "...", "attendees": ["..."]}}'
+                            f'{{"name": "...", "date": "...", "time": "...", "attendees": ["..."], "calendar_link": "..."}}'
                 f"Make sure the response does not contain any ```json``` or ```json``` formatting. It is very important!"
                 f"'date' and 'time' should be in a human-readable format, e.g., 'January 1, 2023' and '2:00 PM', do NOT include day (e.g. 'Friday') in 'date'."
             },
@@ -127,7 +132,7 @@ def parse_event_details(description: EventExtraction) -> EventDetails:
     response = EventDetails.model_validate_json(str_response)
 
     logger.info(
-        f"Parsing complete - Event name: {response.name}, Date: {response.date}, Time: {response.time}, Attendees: {response.attendees}"
+        f"Parsing complete - Event name: {response.name}, Date: {response.date}, Time: {response.time}, Attendees: {response.attendees}, Calendar link: {response.calendar_link}"
     )
     return response
 
@@ -149,12 +154,11 @@ def generate_confirmation_email(event: EventDetails) -> EventConfirmationEmail:
         messages=[
             {
                 "role": "system",
-                "content": f"Generate a natural sounding email message for each of the participants of the event containing the main topic of the meeting. "
+                "content": f"Generate a natural sounding email message for each of the participants of the event. Match the style of the conversation with original input style. "
                            f"Make sure the email body is similar for all the participants. "
                            f"Limit the email body to 200 words. "
                            f"Sign of with your name; Oksana"
-                           f"Only add the 'calendar_link' field if a calendar link is available in the event details, else add None."
-                           f"Return ONLY a list of valid JSON objects, without Markdown formatting (` ```json `, ` ``` `), explanations, or extra text. "
+                            f"Return ONLY a list of valid JSON objects, without Markdown formatting (` ```json `, ` ``` `), explanations, or extra text. "
                            f"Use the following format: "
                             f'[{{"invitee": "...", "subject": "...", "body": "...", "calendar_link": "..."}}, '
                            f'{{"invitee": "...", "subject": "...", "body": "...", "calendar_link": "..."}}]'
@@ -173,6 +177,42 @@ def generate_confirmation_email(event: EventDetails) -> EventConfirmationEmail:
 
 # event = parse_event_details("A meeting with Jane and John to discuss the project roadmap next Tuesday at 2pm")
 # generate_confirmation_email(event)
+
+# --------------------------------------------------------------
+# Step 3: Create Google calendar event
+# --------------------------------------------------------------
+
+
+class GoogleCalendarIntegrator:
+    """A simplified Google Calendar integration handler."""
+
+    SCOPES = ['https://www.googleapis.com/auth/calendar.events']
+    TOKEN_FILE = 'token.pickle'
+    CREDENTIALS_FILE = 'credentials.json'
+
+    def __init__(self):
+        self.service = self._get_calendar_service()
+
+    def _get_calendar_service(self):
+        """Initialize and return the Google Calendar service with proper authentication."""
+        creds = None
+
+        if os.path.exists(self.TOKEN_FILE):
+            with open(self.TOKEN_FILE, 'rb') as token:
+                creds = pickle.load(token)
+
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    self.CREDENTIALS_FILE, self.SCOPES)
+                creds = flow.run_local_server(port=0)
+
+            with open(self.TOKEN_FILE, 'wb') as token:
+                pickle.dump(creds, token)
+
+        return build('calendar', 'v3', credentials=creds)
 
 # --------------------------------------------------------------
 # Step 3: Chain the functions together
@@ -195,6 +235,70 @@ def process_event(user_input: str) -> EventConfirmationEmail:
     # Extract event details
     event_details = parse_event_details(event_info.description)
 
+    try:
+        calendar_integrator = GoogleCalendarIntegrator()
+
+        def parse_datetime(date_str, time_str):
+            """Convert various date & time formats to ISO 8601 format."""
+            date_formats = ["%B %d, %Y", "%d %B %Y", "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"]
+            time_formats = ["%I:%M %p", "%I %p", "%H:%M"]
+
+            # Try parsing date
+            date_obj = next(
+                (datetime.strptime(date_str, fmt) for fmt in date_formats if is_valid_format(date_str, fmt)), None)
+            if not date_obj:
+                raise ValueError(f"Unknown date format: {date_str}")
+
+            # Try parsing time
+            time_obj = next(
+                (datetime.strptime(time_str, fmt).time() for fmt in time_formats if is_valid_format(time_str, fmt)),
+                None)
+            if not time_obj:
+                raise ValueError(f"Unknown time format: {time_str}")
+
+            return datetime.combine(date_obj.date(), time_obj).replace(tzinfo=timezone.utc).isoformat()
+
+        def is_valid_format(date_or_time, fmt):
+            """Check if a string matches a given date/time format."""
+            try:
+                datetime.strptime(date_or_time, fmt)
+                return True
+            except ValueError:
+                return False
+
+
+
+        full_iso_date = parse_datetime(event_details.date, event_details.time)
+        calendar_event = calendar_integrator.service.events().insert(
+            calendarId='primary',
+            body={
+                'summary': event_details.name,
+                "description": event_info.description,
+                'start': {
+                    'dateTime': full_iso_date,
+                    'timeZone': 'UTC',
+                },
+                'end': {
+                    'dateTime': full_iso_date,
+                    'timeZone': 'UTC',
+                },
+                'location': getattr(event_details, 'location', ''),
+                #'attendees': [{'name': person} for person in event_details.attendees],
+                'reminders': {'useDefault': True}
+            },
+            sendUpdates='all'
+        ).execute()
+        logger.info(f"Calendar event created successfully with ID: {calendar_event.get('id')}")
+        event_details.calendar_link = calendar_event.get('htmlLink')
+
+
+
+    except Exception as e:
+        logger.error(f"Failed to create calendar event: {str(e)}")
+        event_details.calendar_link = None
+        sys.exit()
+
+
     # Step 3: Generate confirmation email
     confirmation_email = generate_confirmation_email(event_details)
 
@@ -205,16 +309,16 @@ def process_event(user_input: str) -> EventConfirmationEmail:
 # Step 4: Test the chain with a valid input
 # --------------------------------------------------------------
 
-#user_input = "How about scheduling a 90-minute meeting this Friday at 10 AM with Alex and Sarah to review the latest product updates?"
-user_input = "Can you send an email to Jane to prepare to discuss the project roadmap?"
+user_input = "How about scheduling a 90-minute meeting this Friday at 10 AM with Alex and Sarah to review the latest product updates?"
+#user_input = "Can you send an email to Jane to prepare to discuss the project roadmap?"
 result = process_event(user_input)
 if result:
     for email in result:
         print(f"Email to {email.invitee}")
         print(f"Subject: {email.subject}")
         print(f"Body: {email.body}")
-        if email.calendar_link:
-            print(f"Calendar link: {email.calendar_link}")
+        # if email.calendar_link:
+        #     print(f"Calendar link: {email.calendar_link}")
         print("\n")
 else:
     print("This doesn't appear to be a calendar event request.")
