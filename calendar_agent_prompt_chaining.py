@@ -154,7 +154,9 @@ def generate_confirmation_email(event: EventDetails) -> EventConfirmationEmail:
         messages=[
             {
                 "role": "system",
-                "content": f"Generate a natural sounding email message for each of the participants of the event. Match the style of the conversation with original input style. "
+                "content": f"Generate a natural sounding email message for each of the participants of the event. "
+                           f"If there are no participant's DON'T generate anything and return an empty list."
+                           f"Match the style of the conversation with original input style. "
                            f"Make sure the email body is similar for all the participants. "
                            f"Limit the email body to 200 words. "
                            f"Sign of with your name; Oksana"
@@ -309,8 +311,10 @@ def process_event(user_input: str) -> EventConfirmationEmail:
 # Step 4: Test the chain with a valid input
 # --------------------------------------------------------------
 
-user_input = "How about scheduling a 90-minute meeting this Friday at 10 AM with Alex and Sarah to review the latest product updates?"
+#user_input = "How about scheduling a 90-minute meeting this Friday at 10 AM with Alex and Sarah to review the latest product updates?"
 #user_input = "Can you send an email to Jane to prepare to discuss the project roadmap?"
+user_input = input("Enter your input: ")
+
 result = process_event(user_input)
 if result:
     for email in result:
@@ -329,3 +333,10 @@ else:
 # --------------------------------------------------------------
 
 #user_input = "Can you send an email to Jane to prepare to discuss the project roadmap?"
+
+
+
+###TODO:
+# - figure out atendees/participants: if noone - no email, just calendar event
+# - add location to the event details
+# - if there are atendees - invent emails?
